@@ -1,20 +1,21 @@
 """
 consulta_reembolso.py
 ---------------------
-Fluxo PAI/FILHO para extração de reembolsos do portal Profrotas.
+Fluxo de extração PAI/FILHO de reembolsos do portal Profrotas.
 
-Como funciona:
-  - Não existe API Key individual por posto neste fluxo.
-  - A autenticação é feita UMA vez via Playwright: o navegador headless
-    faz o login no portal web e intercepta o Bearer JWT que o próprio
-    portal usa nas chamadas internas.
-  - Com esse JWT, consultamos as faturas (PAI) e depois os abastecimentos
-    de cada fatura (FILHO), filtrando apenas os postos configurados em
-    POSTOS_ALVO.
+Resumo do fluxo (leitura essencial para o time):
+  - Não usamos API Key individual por posto!
+  - **Autenticação híbrida**: fazemos login automático com o Playwright (browser headless)
+    apenas 1x, capturando o JWT de autenticação das requests internas do portal.
+    Isso evita login manual/repetido e permite automação completa.
+  - Após obter o JWT, consumimos as APIs do portal:
+      - Primeiro buscamos faturas (reembolsos) = nó PAI
+      - Depois, detalhamos abastecimentos dentro dessas faturas = nó FILHO
+      - Só são considerados os postos presentes no POSTOS_ALVO (ver config.py)
 
-Funções exportadas:
-  - executar_rotina_diaria()         → rotina cron global
-  - buscar_e_persistir_periodo()     → on-demand por posto/período (usado pelo interface.py)
+Funções principais expostas:
+  - executar_rotina_diaria()        # Executa a extração "full" via cron (abrange todos os postos/datas)
+  - buscar_e_persistir_periodo()    # Executa on-demand para um posto e período (interface.py chama quando não há dados)
 """
 
 import time
@@ -29,14 +30,13 @@ import database
 from config import USUARIO, SENHA, POSTOS_ALVO
 from helpers import calcular_janela_reembolso, safe_float
 
-
-# ==========================================
-# 1. AUTENTICAÇÃO HÍBRIDA (SNIPER)
-# ==========================================
+# ==========================================================================
+# 1. AUTENTICAÇÃO HÍBRIDA: login automático e interceptação do JWT
+# ==========================================================================
 def obter_sessao_hibrida() -> requests.Session:
     """
-    Abre um browser headless, faz login no portal e intercepta o JWT
-    nas requisições de rede. Retorna uma requests.Session já autenticada.
+    Automatiza login e captura do JWT do portal Profrotas.
+    Retorna uma sessão requests já autenticada.
     """
     sessao = requests.Session()
     sessao.headers.update({
@@ -54,6 +54,7 @@ def obter_sessao_hibrida() -> requests.Session:
         context = browser.new_context()
         page = context.new_page()
 
+        # Função chamada a cada request de rede -- intercepta JWT
         def capturar_token(request):
             nonlocal token_jwt
             if "api-portal.profrotas.com.br" in request.url:
@@ -80,8 +81,10 @@ def obter_sessao_hibrida() -> requests.Session:
             ):
                 pass
         except Exception:
+            # Se não interceptar de cara, aguarda 3s (login pode ser lento)
             page.wait_for_timeout(3000)
 
+        # Recupera cookies da sessão do navegador
         for c in context.cookies():
             sessao.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"])
 
@@ -95,10 +98,9 @@ def obter_sessao_hibrida() -> requests.Session:
 
     return sessao
 
-
-# ==========================================
-# 2. EXTRATORES DE DADOS (API)
-# ==========================================
+# ==========================================================================
+# 2. EXTRATORES DE DADOS DA API (faturas e abastecimentos)
+# ==========================================================================
 @retry(
     retry=retry_if_exception_type(requests.exceptions.RequestException),
     wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -106,11 +108,12 @@ def obter_sessao_hibrida() -> requests.Session:
     reraise=True,
 )
 def _post_com_retry(session: requests.Session, url: str, payload: dict) -> requests.Response:
-    """Wrapper com retry automático e backoff exponencial para chamadas POST."""
+    """
+    Wrapper para chamadas POST com retry e backoff (evita falhas intermitentes).
+    """
     r = session.post(url, json=payload, timeout=30)
     r.raise_for_status()
     return r
-
 
 def buscar_resumo_financeiro(
     session: requests.Session,
@@ -119,8 +122,8 @@ def buscar_resumo_financeiro(
     cnpj_filtro: str | None = None,
 ) -> list[dict]:
     """
-    Busca o cabeçalho das faturas (nó PAI) com paginação completa.
-    Se cnpj_filtro for fornecido, retorna apenas faturas do posto informado.
+    Busca faturas (reembolsos) do portal (nó PAI). Pagina até buscar tudo.
+    Se cnpj_filtro for informado, filtra apenas pelas faturas do posto.
     """
     url = "https://api-portal.profrotas.com.br/api/financeiroRevenda/pesquisa"
     faturas = []
@@ -157,23 +160,21 @@ def buscar_resumo_financeiro(
 
     return faturas
 
-
 def buscar_detalhes_abastecimentos(
     session: requests.Session,
     fatura: dict,
     cnpj_filtro: str | None = None,
 ) -> list[dict]:
     """
-    Busca as linhas de abastecimento de uma fatura (nó FILHO).
-    Itera todas as páginas.
-    Se cnpj_filtro for informado, filtra adicionalmente por CNPJ do posto.
+    Busca abastecimentos (filhos) de uma fatura. Pagina até buscar tudo.
+    Se cnpj_filtro for informado, filtra só o posto específico.
     """
     url = "https://api-portal.profrotas.com.br/api/detalhamentoNotaFiscal/pesquisa"
 
     id_consolidado = str(fatura.get("id"))
     data_inicio = fatura.get("dataInicioPeriodo")
     data_fim = fatura.get("dataFimPeriodo")
-    valor_reembolso = fatura.get("valorReembolso", "")
+    valor_reembolso = fatura.get("valorReembolso") or fatura.get("valorReembolsoComDescontoCredito") or 0.0
 
     frota_pv = fatura.get("frotaPontoVenda", {})
     frota = frota_pv.get("frota", {})
@@ -240,97 +241,150 @@ def buscar_detalhes_abastecimentos(
 
     return abastecimentos_processados
 
-
-# ==========================================
-# 3. PARSER & MAPEAMENTO
-# ==========================================
+# ==========================================================================
+# 3. PARSER DE REGISTRO (mapeia todos os campos úteis para a gente)
+# ==========================================================================
 def processar_registro_api(
     registro_bruto: dict,
-    reembolso_total: str = "",
+    reembolso_total = "",
     status_pagamento: str = "",
     data_pagamento: str = "",
-    cnpj_filtro: str | None = None,
+    cnpj_filtro = None,
 ) -> list[dict]:
     """
-    Transforma o JSON da API no dicionário esperado pelo Supabase.
-    Se cnpj_filtro for fornecido, ignora abastecimentos de outros postos.
+    "Normaliza" cada registro do abastecimento com todos os campos que queremos tratar/salvar.
+    Aplica lógica de compensação de valor/litro, deduz tipo de isenção de NF etc.
+    Só retorna abastecimentos cujos postos estão em POSTOS_ALVO e (opcionalmente) cnpj_filtro.
     """
+    import database
+    import helpers
+    
     processados = []
     filhos = registro_bruto.get("abastecimentosFilhos") or []
 
     for abast in filhos:
         cnpj_posto_transacao = abast.get("cnpjPosto") or ""
 
-        # Filtro primário: apenas postos conhecidos
         if cnpj_posto_transacao not in POSTOS_ALVO:
             continue
-
-        # Filtro secundário (on-demand): apenas o posto solicitado
         if cnpj_filtro and cnpj_posto_transacao != cnpj_filtro:
             continue
 
         data_bruta = abast.get("dataTransacao") or ""
-        data_iso = None
-        if data_bruta and len(data_bruta) >= 10:
-            data_iso = f"{data_bruta[6:10]}-{data_bruta[3:5]}-{data_bruta[0:2]}"
-
+        data_iso = f"{data_bruta[6:10]}-{data_bruta[3:5]}-{data_bruta[0:2]}" if len(data_bruta) >= 10 else None
         hora = abast.get("horaTransacao") or "00:00"
         data_hora_bruta = f"{hora} {data_bruta}".strip()
 
         lista_nfs = abast.get("notasFiscaisEmitidas") or []
-        nfs = ", ".join(
-            [nf.get("numero", "") for nf in lista_nfs if isinstance(nf, dict) and nf.get("numero")]
-        )
+        nfs = ", ".join([nf.get("numero", "") for nf in lista_nfs if isinstance(nf, dict) and nf.get("numero")])
+
+        empresa = abast.get("nomeFrota") or ""
+        
+        # Se empresa tem isenção e não veio NF, marca como "Isenta"
+        if helpers.verificar_isencao(empresa) and not nfs:
+            nfs = "Isenta"
+
+        # --- extração dos detalhes ---
+        combustivel_principal = abast.get("nomeItemAbastecimento") or ""
+        litros_principal = helpers.safe_float(abast.get("totalLitrosAbastecimento")) or 0.0
+        valor_total_transacao = helpers.safe_float(abast.get("valorTotal")) or 0.0
 
         lista_srv = abast.get("itensAbastecimento") or []
-        srv = ", ".join(
-            [s.get("nome", "") for s in lista_srv if isinstance(s, dict) and s.get("nome")]
-        )
+        
+        nome_combustivel_lista = []
+        nome_servico_lista = []
+        litros_combustivel = 0.0
+        valor_combustivel = 0.0
+        litros_arla = 0.0
+        valor_arla = 0.0
+
+        # Separa itens combustíveis (diesel/gasolina) dos itens "serviço" (Arla etc.)
+        for item in lista_srv:
+            nome_item = item.get("nome") or item.get("descricao") or ""
+            qtd_item = helpers.safe_float(item.get("quantidade")) or 0.0
+            
+            v_item = helpers.safe_float(item.get("valorTotal")) or helpers.safe_float(item.get("valor")) or 0.0
+            if v_item <= 0.0:
+                v_unit = helpers.safe_float(item.get("valorUnitario")) or 0.0
+                v_item = qtd_item * v_unit
+            
+            if "arla" in nome_item.lower():
+                nome_servico_lista.append(nome_item)
+                litros_arla += qtd_item
+                valor_arla += v_item
+            else:
+                nome_combustivel_lista.append(nome_item)
+                litros_combustivel += qtd_item
+                valor_combustivel += v_item
+
+        # Ajustes/correções caso Profrotas informe combustivel só na raiz
+        if valor_combustivel == 0.0 and combustivel_principal:
+            if "arla" in combustivel_principal.lower():
+                if combustivel_principal not in nome_servico_lista:
+                    nome_servico_lista.insert(0, combustivel_principal)
+                litros_arla += litros_principal
+                if valor_total_transacao > 0:
+                    valor_arla += (valor_total_transacao - valor_arla)
+            else:
+                if combustivel_principal not in nome_combustivel_lista:
+                    nome_combustivel_lista.insert(0, combustivel_principal)
+                litros_combustivel += litros_principal
+                if valor_total_transacao > 0:
+                    valor_combustivel += (valor_total_transacao - valor_arla)
+
+        # Se valor total não veio, soma manualmente
+        if valor_total_transacao <= 0.0:
+            valor_total_transacao = valor_combustivel + valor_arla
+            
+        litros_total = litros_principal if litros_principal > 0 else (litros_combustivel + litros_arla)
 
         placa = abast.get("placaVeiculo") or ""
         motorista = abast.get("nomeMotorista") or ""
-        placa_motorista = f"{placa}\n{motorista}".strip() if placa or motorista else ""
-
         posto_uuid = database.get_posto_id(cnpj_posto_transacao)
 
+        # Adiciona o registro já pronto/normalizado pra salvar no Supabase
         processados.append({
             "posto_id": posto_uuid,
-            "empresa": abast.get("nomeFrota") or "",
-            "reembolso_total": safe_float(reembolso_total),
+            "empresa": empresa,
+            "reembolso_total": helpers.safe_float(reembolso_total),
             "data_bruta": data_hora_bruta,
             "data": data_iso,
             "hora": hora,
             "nota_fiscal": nfs,
-            "placa_motorista": placa_motorista,
-            "litros": safe_float(abast.get("totalLitrosAbastecimento")),
-            "combustivel": abast.get("nomeItemAbastecimento") or "",
-            "servico": srv,
+            "placa_motorista": f"{placa}\n{motorista}".strip() if placa or motorista else "",
+            
+            "litros": round(litros_total, 3),
+            "combustivel": " + ".join(nome_combustivel_lista) or combustivel_principal,
+            "servico": " + ".join(nome_servico_lista),
             "local_destino": abast.get("nomeUnidade") or "",
-            "valor_total": safe_float(abast.get("valorTotal")),
+            "valor_total": round(valor_total_transacao, 2),
             "qtd_nfs": int(abast.get("quantidadeNotasFiscais") or 0),
             "status_pagamento": status_pagamento,
             "data_pagamento": data_pagamento,
+            
+            "litros_combustivel": round(litros_combustivel, 3),
+            "valor_combustivel": round(valor_combustivel, 2),
+            "litros_arla": round(litros_arla, 3),
+            "valor_arla": round(valor_arla, 2),
         })
 
     return processados
 
-
-# ==========================================
-# 4. ON-DEMAND POR POSTO/PERÍODO
-# ==========================================
+# ==========================================================================
+# 4. ON-DEMAND POR POSTO E PERÍODO (acesso rápido)
+# ==========================================================================
 def buscar_e_persistir_periodo(cnpj_posto: str, data_ini: str, data_fim: str) -> None:
     """
-    Consulta o portal Profrotas para um posto e período específicos,
-    persiste os reembolsos no Supabase e retorna.
-
-    Chamado pelo interface.py quando o banco não tem dados para o período.
-    O intervalo aceito é YYYY-MM-DD para ambos os parâmetros.
+    Busca reembolso no portal para o posto/período específico, 
+    deduplica, e grava no Supabase.
+    Chamada pelo interface.py quando não há dados ainda no banco.
+    data_ini/data_fim: formato ISO (YYYY-MM-DD)
     """
-    # Converte para o formato ISO com hora esperado pela API do portal
+    # Formato esperado pela API (ISO completo)
     data_inicio_api = f"{data_ini}T00:00:00.000Z"
     data_fim_api    = f"{data_fim}T23:59:59.000Z"
 
-    print(f"[on-demand reembolso] Iniciando busca para {cnpj_posto} ({data_ini} → {data_fim})")
+    print(f"[on-demand reembolso] Iniciando busca para {cnpj_posto} ({data_ini} -> {data_fim})")
 
     try:
         sessao = obter_sessao_hibrida()
@@ -349,7 +403,7 @@ def buscar_e_persistir_periodo(cnpj_posto: str, data_ini: str, data_fim: str) ->
             print(f"[on-demand reembolso] Nenhum abastecimento encontrado para {cnpj_posto} no período.")
             return
 
-        # Deduplica em memória antes de persistir
+        # Deduplicação (evita sobrescrita de registros idênticos)
         vistos: set = set()
         dados_limpos = []
         for item in todos_abastecimentos:
@@ -364,14 +418,19 @@ def buscar_e_persistir_periodo(cnpj_posto: str, data_ini: str, data_fim: str) ->
     except Exception as e:
         print(f"[on-demand reembolso] Erro para {cnpj_posto}: {e}")
 
-
-# ==========================================
-# 5. LOOP PRINCIPAL (rotina diária / cron)
-# ==========================================
+# ==========================================================================
+# 5. LOOP GERAL: rotina diária (cron) de integração
+# ==========================================================================
 def executar_rotina_diaria():
+    """
+    Executa o batch global diário. Faz login, extração paralela, deduplica
+    e dispara lote para o Supabase.
+    Ideal para rodar via cron/timer.
+    """
     inicio_relogio = time.perf_counter()
 
-    data_inicio_busca, data_fim_busca = calcular_janela_reembolso(dias_historico=7)
+    # Janela: extração dos últimos 90 dias (pode mudar caso precise)
+    data_inicio_busca, data_fim_busca = calcular_janela_reembolso(dias_historico=90)
 
     sessao = obter_sessao_hibrida()
 
@@ -385,12 +444,13 @@ def executar_rotina_diaria():
 
     todos_abastecimentos = []
 
+    # Extração paralela para acelerar (define max_workers conforme hardware)
     max_workers = 5
     print(f"\nIniciando extração paralela com {max_workers} threads...")
 
     def processar_fatura_worker(indice, fatura_obj):
         empresa = fatura_obj.get("frotaPontoVenda", {}).get("frota", {}).get("nomeFantasia", "Desconhecida")
-        print(f"  [+] {indice}/{total_faturas} | Extraindo: {empresa} (ID: {fatura_obj.get('id')})...")
+        print(f"  [processo] {indice}/{total_faturas} | Extraindo: {empresa} (ID: {fatura_obj.get('id')})...")
         return buscar_detalhes_abastecimentos(sessao, fatura_obj)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -404,11 +464,12 @@ def executar_rotina_diaria():
                 if detalhes:
                     todos_abastecimentos.extend(detalhes)
             except Exception as e:
-                print(f"  [!] Falha crítica ao extrair detalhes de uma fatura: {e}")
+                print(f"  [erro] Falha crítica ao extrair detalhes de uma fatura: {e}")
 
     print(f"\nExtração concluída. Total de abastecimentos: {len(todos_abastecimentos)}")
 
     if todos_abastecimentos:
+        # Deduplica antes de gravar (algumas faturas podem referenciar os mesmos registros)
         vistos: set = set()
         dados_limpos = []
         for item in todos_abastecimentos:
@@ -427,6 +488,6 @@ def executar_rotina_diaria():
     fim_relogio = time.perf_counter()
     print(f"\nTempo total: {fim_relogio - inicio_relogio:.2f}s")
 
-
+# Para testes locais ou execução manual via terminal
 if __name__ == "__main__":
     executar_rotina_diaria()
