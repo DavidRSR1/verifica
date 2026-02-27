@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+supabase
+playwright
+tenacity
+python-dotenv
+requests
