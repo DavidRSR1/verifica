@@ -1,15 +1,57 @@
 """
-interface.py
-------------
-FastAPI — Interface de consulta multi-adquirente.
+====================================================================================
+interface.py — API FastAPI do Painel Multi-Adquirente
+====================================================================================
 
-Correções aplicadas:
-  - buscar_e_persistir_periodo implementada em consulta_reembolso.py e importada aqui
-  - Lock de on-demand substituído por threading.Lock (thread-safe)
-  - safe_float / safe_sum centralizados em helpers.py
-  - Paginação completa no on-demand de vendas (via _buscar_e_persistir_vendas)
-  - HTML servido inline com style.css e functions.js embutidos
-  - RLS: squad_id aplicado corretamente no cliente com JWT do usuário
+Este arquivo é a INTERFACE central das rotas da aplicação multi-adquirente Profrotas.
+
+───────────────────────────── GUIA PRÁTICO PARA A EQUIPE ───────────────────────────
+
+► VISÃO GERAL
+
+- Aqui estão os endpoints REST para vendas/reembolsos dos postos (principalmente Profrotas, mas extensível).
+- Toda requisição chega por aqui e é roteada p/ o provider correspondente.
+- Endpoints principais:
+    - /api/providers
+    - /api/{provider}/postos
+    - /api/{provider}/vendas
+    - /api/{provider}/reembolsos
+    - /api/{provider}/resumo
+    - /         (serve o painel web já com CSS+JS embutidos)
+
+► CONCEITOS IMPORTANTES
+
+- "Provider" é uma classe que incorpóra a integração (ex: Profrotas, Redefrota etc)
+    - Para adicionar/adaptar um novo, crie uma classe herdando BaseProvider e adicione em PROVIDERS.
+- "Mock" automático: se não houver dependências importadas, cairá em mocks p/ facilitar dev/tst offline.
+- Funcionalidades auxiliares de float/soma estão em helpers.py — USE SEMPRE safe_float/safe_sum para precisão!
+- BLOQUEIOS PARALELOS: Locks via threading.Lock + set em _ondemand_mutex/_ondemand_set para evitar duas syncs simultâneas (vendas/reembolso) do mesmo posto/período (leitura de API é custosa).
+- Toda obtenção de dados usa "on-demand": se não houver no banco, busca automático na API Profrotas.
+- RLS/Squad: consultas consideram squad_id do usuário (extraído do JWT); admin (role=admin) acessa TODOS postos.
+- Prints para debugging: busque por "[on-demand vendas]", "[vendas]", "[reembolso on-demand]" etc.
+
+► FRONTEND
+
+- index.html no frontend/ é servido com injeção automática dos arquivos style.css e functions.js.
+- Para mudar aparência ou lógica, edite frontend/style.css ou functions.js.
+- As tags <style></style> e <script></script> no index.html SÃO PLACEHOLDERS — não remova!
+
+───────────────────────────── ATALHO RÁPIDO DO FLUXO ────────────────────────────────
+
+- Cada método no ProfrotasProvider:
+    - get_postos(): lista postos do squad conforme RLS, ou todos se admin.
+    - get_vendas(): busca vendas do banco; se vazio, busca na API e persiste na base; retorna lista de dicts padronizados.
+    - get_reembolsos(): igual aos vendas, mas filtrando por data ou data_pagamento.
+- Funções "mock" para ambiente de desenvolvimento: _mock_vendas, _mock_reembolsos
+    - São usadas se helpers.py/database/config NÃO puderem ser importados.
+
+───────────────────────────── DICAS USUAIS/PERGUNTAS FREQUENTES ─────────────────────
+
+- Para liberar dois syncs simultâneos de vendas/reembolso do MESMO posto/período: NÃO PERMITIDO (lock no _ondemand_set); para outro período/posto, OK.
+- Erro em provider? Veja se seu provider está registrado em PROVIDERS (fim do arquivo).
+- Dúvidas sobre helpers/config? padronize nomeações no helpers.py sempre que possível!
+
+====================================================================================
 """
 
 from __future__ import annotations
@@ -25,7 +67,9 @@ from fastapi import FastAPI, Query, HTTPException, Header, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ── importações do projeto ──────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+# Importações do projeto/mocks: garanta portabilidade p/ devs/offline
+# --------------------------------------------------------------------------
 try:
     import database
     from helpers import safe_float, safe_sum
@@ -33,6 +77,7 @@ try:
     _HAS_PROJECT = True
 except ImportError:
     _HAS_PROJECT = False
+    # MOCKS para facilitar desenvolvimento sem dependências
     POSTOS_ALVO = {
         "03.951.672/0001-70": "Auto Posto Sof Norte Ltda",
         "36.203.543/0001-53": "Mg Comercio De Combustiveis Ltda",
@@ -46,6 +91,7 @@ except ImportError:
     ENDPOINT_VENDAS = "/api/revenda/autorizacao/pesquisa"
 
     def safe_float(v) -> Optional[float]:
+        # Manter precisão! Evita crash em conversão value/None/vazio/etc.
         if v is None or v == "" or v == "None":
             return None
         try:
@@ -54,38 +100,36 @@ except ImportError:
             return None
 
     def safe_sum(records: list[dict], key: str) -> float:
+        # Soma padrão resiliente (usa safe_float)
         return sum(safe_float(r.get(key)) or 0.0 for r in records)
 
-
-# ============================================================
-# LOCK THREAD-SAFE para on-demand
-# ============================================================
+# --------------------------------------------------------------------------
+# BLOQUEIO para on-demand (evita sync concorrente do mesmo recurso)
+# --------------------------------------------------------------------------
 _ondemand_mutex = threading.Lock()
 _ondemand_set: set[str] = set()
 
-
 def _ondemand_try_acquire(key: str) -> bool:
-    """Retorna True se conseguiu adquirir o lock para a chave, False se já está em progresso."""
+    """Tenta adquirir lock para o recurso. Se já em uso, retorna False."""
     with _ondemand_mutex:
         if key in _ondemand_set:
             return False
         _ondemand_set.add(key)
         return True
 
-
 def _ondemand_release(key: str):
+    """Libera o lock para novo uso no mesmo recurso (período+posto)."""
     with _ondemand_mutex:
         _ondemand_set.discard(key)
 
-
-# ============================================================
-# SUPABASE CLIENT COM JWT DO USUÁRIO
-# ============================================================
+# --------------------------------------------------------------------------
+# Instância Supabase (autenticação RLS se JWT; service key para tasks internas)
+# --------------------------------------------------------------------------
 def get_sb_client(user_jwt: str | None = None):
     """
-    Retorna cliente Supabase.
-    Se user_jwt for fornecido, usa o token do usuário (RLS ativa).
-    Caso contrário usa a service key (sem RLS — apenas operações internas).
+    Cliente Supabase para uso de ORM de consultas.
+    - user_jwt → RLS aplicada (usuário final)
+    - None     → service key (apenas para tasks internas/sync)
     """
     if not _HAS_PROJECT:
         return None
@@ -96,9 +140,11 @@ def get_sb_client(user_jwt: str | None = None):
         sb.auth.set_session(access_token=user_jwt, refresh_token="")
     return sb
 
-
 def get_perfil(sb, user_jwt: str | None) -> dict | None:
-    """Busca perfil + squad_id do usuário autenticado."""
+    """
+    Retorna perfil (id, squad_id, role) do usuário autenticado (JWT).
+    Se não autorizado ou erro, retorna None.
+    """
     if not sb or not user_jwt:
         return None
     try:
@@ -111,11 +157,13 @@ def get_perfil(sb, user_jwt: str | None) -> dict | None:
     except Exception:
         return None
 
-
 def get_postos_do_squad(sb, squad_id: str | None) -> list[dict]:
+    """
+    Busca postos habilitados para o squad atual.
+    Se sem conexão com DB, retorna mock do config.
+    """
     if not sb:
         return [{"cnpj": c, "nome": n} for c, n in POSTOS_ALVO.items()]
-
     try:
         q = (
             sb.table("postos")
@@ -130,22 +178,21 @@ def get_postos_do_squad(sb, squad_id: str | None) -> list[dict]:
         print("Erro ao buscar postos:", e)
         return []
 
-
-# ============================================================
-# ON-DEMAND: vendas — com paginação completa
-# ============================================================
-def _buscar_e_persistir_vendas(cnpj_posto: str, data_ini: str, data_fim: str) -> None:
+# --------------------------------------------------------------------------
+# VENDAS: on-demand (busca Profrotas — paginação completa — e persiste)
+# --------------------------------------------------------------------------
+def _buscar_e_persistir_vendas(cnpj_posto: str, data_ini: str, data_fim: str) -> list[dict]:
     """
-    Consulta a API Profrotas para o período solicitado (todas as páginas),
-    persiste no Supabase e retorna.
+    Consulta toda venda do período na Profrotas e grava no Supabase.
+    Retorna os dados mapeados para uso imediato no front-end.
     """
     if not _HAS_PROJECT:
-        return
+        return []
 
     token_atual = database.obter_api_key_posto(cnpj_posto)
     if not token_atual:
         print(f"[on-demand vendas] Sem API Key para {cnpj_posto}")
-        return
+        return []
 
     from playwright.sync_api import sync_playwright
     from consulta_venda import mapear_venda, _buscar_vendas_paginado
@@ -159,7 +206,6 @@ def _buscar_e_persistir_vendas(cnpj_posto: str, data_ini: str, data_fim: str) ->
             browser = p.chromium.launch(headless=True)
             request_context = p.request.new_context(base_url=BASE_URL)
 
-            # Detecta renovação de token
             probe_payload = {
                 "pagina": 1, "tamanhoPagina": 1,
                 "idAutorizacaoPagamentoInicial": 0,
@@ -180,9 +226,8 @@ def _buscar_e_persistir_vendas(cnpj_posto: str, data_ini: str, data_fim: str) ->
 
             if not probe.ok:
                 print(f"[on-demand vendas] Erro API {probe.status}: {probe.text()}")
-                return
+                return []
 
-            # Paginação completa
             todos_registros = _buscar_vendas_paginado(
                 request_context, token_atual, data_ini_api, data_fim_api
             )
@@ -193,20 +238,20 @@ def _buscar_e_persistir_vendas(cnpj_posto: str, data_ini: str, data_fim: str) ->
                 registros_mapeados = [mapear_venda(r, cnpj_posto, posto_uuid) for r in vendas]
                 database.enviar_para_supabase(registros_mapeados, "vendas_diarias")
                 print(f"[on-demand vendas] {len(registros_mapeados)} vendas persistidas para {cnpj_posto}")
+                return registros_mapeados # Devolve direto para não precisar ler do banco!
 
     except Exception as e:
         print(f"[on-demand vendas] Erro inesperado: {e}")
     finally:
         if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
+            try: browser.close()
+            except Exception: pass
+            
+    return []
 
-
-# ============================================================
-# BASE PROVIDER
-# ============================================================
+# --------------------------------------------------------------------------
+# Definição de Provider: padrão para integrar novos adquirentes
+# --------------------------------------------------------------------------
 class BaseProvider(ABC):
     name: str
     slug: str
@@ -222,32 +267,29 @@ class BaseProvider(ABC):
     @abstractmethod
     def get_reembolsos(self, cnpj_posto: str, data_ini: str, data_fim: str, sb=None, by_pagamento: bool = True) -> list[dict]: ...
 
-
-# ============================================================
-# PROVIDER: PROFROTAS
-# ============================================================
+# --------------------------------------------------------------------------
+# Provider Profrotas: padrão/produção
+# --------------------------------------------------------------------------
 class ProfrotasProvider(BaseProvider):
     name  = "Profrotas"
     slug  = "profrotas"
     color = "#00C896"
-    icon  = "⛽"
+    icon  = ""  # Removido emoji
 
     def get_postos(self, sb=None, squad_id: str | None = None) -> list[dict]:
+        # Busca postos permitidos via RLS ou todos se admin
         return get_postos_do_squad(sb, squad_id)
 
     def get_vendas(self, cnpj_posto: str, data_ini: str, data_fim: str, sb=None) -> list[dict]:
         if not _HAS_PROJECT:
             return _mock_vendas(cnpj_posto)
-
-        # Usa service key para leitura (RLS de postos é controlada na camada de autenticação da rota)
+            
         sb_svc = get_sb_client()
-        if not sb_svc:
-            return []
-
+        if not sb_svc: return []
+        
         posto_id = database.get_posto_id(cnpj_posto)
-        if not posto_id:
-            return []
-
+        if not posto_id: return []
+        
         try:
             resp = (
                 sb_svc.table("vendas_diarias")
@@ -260,46 +302,33 @@ class ProfrotasProvider(BaseProvider):
                 .execute()
             )
             rows = resp.data or []
-
-            # on-demand: banco vazio → busca na API
+            
+            # Se não há dados, busca na API e DEVOLVE direto (fim do loop infinito!)
             lock_key = f"vendas:{cnpj_posto}:{data_ini}:{data_fim}"
             if not rows and _ondemand_try_acquire(lock_key):
                 try:
                     print(f"[vendas] Sem dados em {cnpj_posto} {data_ini}–{data_fim}. Buscando na API...")
-                    _buscar_e_persistir_vendas(cnpj_posto, data_ini, data_fim)
-                    resp2 = (
-                        sb_svc.table("vendas_diarias")
-                        .select("*")
-                        .eq("posto_id", posto_id)
-                        .gte("data_abastecimento", data_ini)
-                        .lte("data_abastecimento", data_fim)
-                        .order("data_abastecimento", desc=True)
-                        .limit(5000)
-                        .execute()
-                    )
-                    rows = resp2.data or []
+                    novas_vendas = _buscar_e_persistir_vendas(cnpj_posto, data_ini, data_fim)
+                    if novas_vendas:
+                        rows = novas_vendas # Associa o resultado mapeado diretamente
                 finally:
                     _ondemand_release(lock_key)
-
             return rows
         except Exception as e:
             print(f"Erro get_vendas: {e}")
             return []
 
     def get_reembolsos(self, cnpj_posto: str, data_ini: str, data_fim: str, sb=None, by_pagamento: bool = True) -> list[dict]:
+        # Mock local/offline
         if not _HAS_PROJECT:
             return _mock_reembolsos(cnpj_posto)
-
         sb_svc = get_sb_client()
         if not sb_svc:
             return []
-
         posto_id = database.get_posto_id(cnpj_posto)
         if not posto_id:
             return []
-
         date_col = "data_pagamento" if by_pagamento else "data"
-
         try:
             resp = (
                 sb_svc.table("relatorio_abastecimentos")
@@ -312,8 +341,7 @@ class ProfrotasProvider(BaseProvider):
                 .execute()
             )
             rows = resp.data or []
-
-            # on-demand: sem dados → consulta portal
+            # Se não há dados, busca on-demand no portal (com lock)
             lock_key = f"reembolso:{cnpj_posto}:{data_ini}:{data_fim}"
             if not rows and _ondemand_try_acquire(lock_key):
                 try:
@@ -335,44 +363,43 @@ class ProfrotasProvider(BaseProvider):
                     print(f"[reembolso on-demand] Falha: {e_od}")
                 finally:
                     _ondemand_release(lock_key)
-
             return rows
         except Exception as e:
             print(f"Erro get_reembolsos: {e}")
             return []
 
-
-# ============================================================
-# PROVIDER: REDEFROTA (placeholder)
-# ============================================================
+# --------------------------------------------------------------------------
+# Provider Redefrota (placeholder — amplie aqui!)
+# --------------------------------------------------------------------------
 class RedefrotaProvider(BaseProvider):
     name  = "Redefrota"
     slug  = "redefrota"
     color = "#FF6B35"
-    icon  = "🚛"
+    icon  = ""  # Removido emoji
 
     def get_postos(self, sb=None, squad_id: str | None = None) -> list[dict]:
+        # Sem integração ainda
         return []
 
     def get_vendas(self, cnpj_posto: str, data_ini: str, data_fim: str, sb=None) -> list[dict]:
+        # Sem integração ainda
         return []
 
     def get_reembolsos(self, cnpj_posto: str, data_ini: str, data_fim: str, sb=None, by_pagamento: bool = True) -> list[dict]:
+        # Sem integração ainda
         return []
 
-
-# ============================================================
-# REGISTRO
-# ============================================================
+# --------------------------------------------------------------------------
+# Registro de providers — só precisa adicionar aqui para liberar em rotas.
+# --------------------------------------------------------------------------
 PROVIDERS: dict[str, BaseProvider] = {
     "profrotas": ProfrotasProvider(),
     "redefrota": RedefrotaProvider(),
 }
 
-
-# ============================================================
-# MOCKS
-# ============================================================
+# --------------------------------------------------------------------------
+# Mocks de vendas/reembolsos para dev/teste offline.
+# --------------------------------------------------------------------------
 def _mock_vendas(cnpj: str) -> list[dict]:
     from random import uniform, choice, randint
     hoje = datetime.now()
@@ -393,7 +420,6 @@ def _mock_vendas(cnpj: str) -> list[dict]:
         }
         for i in range(10)
     ]
-
 
 def _mock_reembolsos(cnpj: str) -> list[dict]:
     from random import uniform, choice, randint
@@ -417,10 +443,9 @@ def _mock_reembolsos(cnpj: str) -> list[dict]:
         for _ in range(8)
     ]
 
-
-# ============================================================
-# APP FASTAPI
-# ============================================================
+# --------------------------------------------------------------------------
+# Instancia APP FastAPI + CORS liberado (simples para API pública)
+# --------------------------------------------------------------------------
 app = FastAPI(title="Painel Multi-Adquirente", version="2.1.0")
 
 app.add_middleware(
@@ -430,15 +455,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def jwt_from_header(authorization: str | None = Header(default=None)) -> str | None:
+    """
+    Extrai o token Bearer do cabeçalho Authorization.
+    Use nas rotas como Depends.
+    """
     if authorization and authorization.startswith("Bearer "):
         return authorization[7:]
     return None
 
-
 def _ctx(jwt: str | None):
-    """Retorna (sb, perfil, squad_id) para a requisição."""
+    """
+    Atalho: retorna (sb, perfil, squad_id) autenticados para uso nas rotas.
+    - Se admin, ignora squad_id.
+    """
     sb       = get_sb_client(jwt)
     perfil   = get_perfil(sb, jwt)
     squad_id = perfil.get("squad_id") if perfil else None
@@ -447,11 +477,15 @@ def _ctx(jwt: str | None):
         squad_id = None  # admin sem squad vê tudo
     return sb, perfil, squad_id
 
-
-# ── Routes ─────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+# Rotas REST públicas (api central)
+# --------------------------------------------------------------------------
 
 @app.get("/api/providers")
 def listar_providers(jwt: str | None = Depends(jwt_from_header)):
+    """
+    Lista todos os providers disponíveis (e se possuem postos cadastrados).
+    """
     sb, perfil, squad_id = _ctx(jwt)
     return [
         {
@@ -464,15 +498,16 @@ def listar_providers(jwt: str | None = Depends(jwt_from_header)):
         for p in PROVIDERS.values()
     ]
 
-
 @app.get("/api/{provider}/postos")
 def listar_postos(provider: str, jwt: str | None = Depends(jwt_from_header)):
+    """
+    Lista postos disponíveis ao usuário, respeitando RLS/squad.
+    """
     p = PROVIDERS.get(provider)
     if not p:
         raise HTTPException(404, "Provider não encontrado")
     sb, perfil, squad_id = _ctx(jwt)
     return p.get_postos(sb, squad_id)
-
 
 @app.get("/api/{provider}/vendas")
 def get_vendas(
@@ -482,6 +517,10 @@ def get_vendas(
     data_fim: str = Query(default=None),
     jwt: str | None = Depends(jwt_from_header),
 ):
+    """
+    Busca todas as vendas de um CNPJ/posto em um período.
+    - Se vazio no banco, força consulta on-demand na API e salva.
+    """
     p = PROVIDERS.get(provider)
     if not p:
         raise HTTPException(404, "Provider não encontrado")
@@ -490,7 +529,6 @@ def get_vendas(
     fim = data_fim or hoje.strftime("%Y-%m-%d")
     sb, _, _ = _ctx(jwt)
     return p.get_vendas(cnpj, ini, fim, sb)
-
 
 @app.get("/api/{provider}/reembolsos")
 def get_reembolsos(
@@ -501,6 +539,10 @@ def get_reembolsos(
     by_pagamento: int = Query(default=1),
     jwt: str | None = Depends(jwt_from_header),
 ):
+    """
+    Busca reembolsos por posto e período.
+    - by_pagamento=1 consulta por data de pagamento (default).
+    """
     p = PROVIDERS.get(provider)
     if not p:
         raise HTTPException(404, "Provider não encontrado")
@@ -510,7 +552,6 @@ def get_reembolsos(
     sb, _, _ = _ctx(jwt)
     return p.get_reembolsos(cnpj, ini, fim, sb, by_pagamento=bool(by_pagamento))
 
-
 @app.get("/api/{provider}/resumo")
 def get_resumo(
     provider: str,
@@ -519,6 +560,9 @@ def get_resumo(
     data_fim: str = Query(default=None),
     jwt: str | None = Depends(jwt_from_header),
 ):
+    """
+    Gera resumo de vendas/litros/reembolso quantitativo do período consultado.
+    """
     p = PROVIDERS.get(provider)
     if not p:
         raise HTTPException(404, "Provider não encontrado")
@@ -542,21 +586,20 @@ def get_resumo(
         "qtd_reembolsos":  len(reembs),
     }
 
-
-# ── Frontend ────────────────────────────────────────────────
+# --------------------------------------------------------------------------
+# Frontend: serve index.html já com CSS e JS injetados inline
+# --------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(_build_html())
 
-
 def _build_html() -> str:
     """
-    Lê index.html da pasta frontend/ e injeta style.css e functions.js inline.
-    O index.html deve manter as tags <style>\n</style> e <script>\n</script> vazias
-    como placeholders — o conteúdo dos arquivos será injetado entre elas.
+    Injeta frontend/style.css + functions.js no index.html.
+    Atenção: os arquivos do frontend DEVEM estar na mesma pasta ("frontend/").
+    No index.html, mantenha as tags <style></style> e <script></script> vazias!
     """
     base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
-
     def _read(name: str) -> str:
         path = os.path.join(base, name)
         try:
@@ -569,13 +612,14 @@ def _build_html() -> str:
     css  = _read("style.css")
     js   = _read("functions.js")
 
-    # Injeta CSS e JS — regex tolerante a espaços/quebras entre as tags
+    # Regex tolerante: injeta CSS e JS entre as tags vazias (<style/>, <script/>)
     html = re.sub(r"<style>\s*</style>", "<style>\n" + css + "\n</style>", html)
     html = re.sub(r"<script>\s*</script>", "<script>\n" + js + "\n</script>", html)
-
     return html
 
-
+# --------------------------------------------------------------------------
+# Atalho: executar local, dev/testes (ex: python interface.py)
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("interface:app", host="0.0.0.0", port=8000, reload=True)
