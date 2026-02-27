@@ -2,11 +2,16 @@ import traceback
 from supabase import create_client, Client
 from config import URL_SUPABASE, CHAVE_SUPABASE
 
-
 # ==========================================
-# CONEXÃO
+# CONEXÃO SUPABASE
+# Este bloco centraliza toda a criação/conexão com o Supabase.
+# Se mudar as credenciais ou endpoint, ajuste no .env e config.py
 # ==========================================
 def get_supabase_client() -> Client | None:
+    """
+    Cria e retorna cliente Supabase usando variáveis do .env.
+    Lembre: conectar 1x só e reutilizar a instância!
+    """
     try:
         cliente = create_client(URL_SUPABASE, CHAVE_SUPABASE)
         print("Supabase conectado.")
@@ -15,24 +20,28 @@ def get_supabase_client() -> Client | None:
         print(f"Erro ao conectar com o Supabase: {e}")
         return None
 
-
-# Instância global do cliente para este módulo
+# Instância global do cliente para este módulo (evita reconectar toda hora)
 supabase = get_supabase_client()
 
+# Cache in-memory (evita consultas repetidas para o mesmo CNPJ)
 _cache_postos = {}
 
-# Chaves de upsert por tabela
+# Defina a(s) chave(s) de upsert de cada tabela (aplica regra de conflict do Supabase)
 _CONFLICT_KEYS = {
     "relatorio_abastecimentos": "empresa,data_bruta,valor_total",
     "vendas_diarias":           "id_autorizacao",
 }
 
+# ==========================================
+# CONSULTA DE POSTOS (tudo relacionado a tabela de Postos)
+# ==========================================
 
-# ==========================================
-# POSTOS
-# ==========================================
 def get_posto_id(cnpj: str) -> str | None:
-    """Busca o UUID do posto pelo CNPJ no Supabase (com cache em memória)."""
+    """
+    Busca o UUID (id) do posto pelo CNPJ via Supabase - com cache local.
+    Prático: evita múltiplas consultas para o mesmo CNPJ durante o processamento!
+    Retorna None se não encontrar.
+    """
     if not supabase:
         return None
 
@@ -46,14 +55,15 @@ def get_posto_id(cnpj: str) -> str | None:
         else:
             _cache_postos[cnpj] = None
         return _cache_postos[cnpj]
-
     except Exception as e:
         print(f"Erro ao buscar posto_id para {cnpj}: {e}")
         return None
 
-
 def obter_api_key_posto(cnpj: str) -> str | None:
-    """Recupera a API Key atual de um posto específico no Supabase."""
+    """
+    Busca a API Key salva para o posto do CNPJ informado.
+    Use sempre que for consultar vendas desse posto.
+    """
     if not supabase:
         return None
     try:
@@ -65,9 +75,11 @@ def obter_api_key_posto(cnpj: str) -> str | None:
         print(f"Erro ao buscar chave no banco: {e}")
         return None
 
-
 def atualizar_api_key_posto(cnpj: str, nova_chave: str):
-    """Atualiza a API Key no banco quando a renovação automática é disparada."""
+    """
+    Atualiza a API Key do posto especificado quando o JWT for renovado.
+    Prático: chamada automática, mantém o banco sempre com o token válido.
+    """
     if not supabase:
         return
     try:
@@ -76,12 +88,20 @@ def atualizar_api_key_posto(cnpj: str, nova_chave: str):
     except Exception as e:
         print(f"Erro ao persistir nova chave: {e}")
 
-
 # ==========================================
-# ESCRITA
+# ESCRITA (Upsert genérico para qualquer tabela)
+# Use SEMPRE este método para inserir/atualizar dados!
 # ==========================================
 def enviar_para_supabase(dados: list[dict], nome_tabela: str) -> None:
-    """Envia os dados para a tabela do Supabase via upsert."""
+    """
+    Insere (ou atualiza - upsert) lista de registros em uma tabela do Supabase.
+    - Regra: usa upsert se houver chave de conflito configurada, senão faz insert.
+    - Prático: já lida com situações de duplicidade!
+    - DICA: sempre envie uma lista, mesmo com 1 registro (supabase espera isso).
+    Param:
+      dados        Lista de dicts para inserir/atualizar.
+      nome_tabela  Nome da tabela alvo no Supabase.
+    """
     if not dados:
         print("Nenhum dado para enviar ao Supabase.")
         return
@@ -93,6 +113,7 @@ def enviar_para_supabase(dados: list[dict], nome_tabela: str) -> None:
 
     try:
         query = supabase.table(nome_tabela)
+        # upsert: insere ou atualiza, conforme conflito configurado (_CONFLICT_KEYS)
         resposta = (
             query.upsert(dados, on_conflict=on_conflict).execute()
             if on_conflict
