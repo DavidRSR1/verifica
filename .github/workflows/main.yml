@@ -18,8 +18,8 @@ jobs:
         run: |
           response=$(curl -s \
             -X GET "${SUPABASE_URL}/rest/v1/" \
-            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}")
+            -H "apikey: ${SUPABASE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_KEY}")
           if [ -z "$response" ]; then
             echo "Error: empty response when pinging." >&2
             exit 1
